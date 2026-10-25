@@ -10,16 +10,21 @@
 // Crate-free SX1262 driver: every command is raw SPI, so nothing can hang inside
 // the sx1262 / regiface crates. Replace your main.rs with this file.
 
+use core::fmt::Write;
 use defmt_rtt as _;
 use embedded_hal::delay::DelayNs;
+use embedded_hal::pwm::SetDutyCycle;
 use embedded_hal::spi::{Operation, SpiDevice};
 use embedded_hal_bus::spi::ExclusiveDevice;
-use embedded_io::{Read, Write};
+use embedded_io::{Read, Write as EmbeddedWrite};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::gpio::{DriveMode, Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::ledc::channel::{ChannelHW, ChannelIFace};
+use esp_hal::ledc::timer::TimerIFace;
+use esp_hal::ledc::{HighSpeed, LSGlobalClkSource, Ledc, LowSpeed, channel, timer};
 use esp_hal::main;
 use esp_hal::spi::Mode;
 use esp_hal::spi::master::{Config, Spi};
@@ -28,12 +33,12 @@ use esp_hal::uart::Uart;
 use esp_println as _;
 use esp_println::logger::init_logger;
 use esp_println::println;
-use heapless::Vec;
+use heapless::{String, Vec, format};
 use regiface::Command;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const IS_TX: bool = true;
+const IS_TX: bool = false;
 
 const FREQUENCY_HZ: u64 = 915_200_000;
 const PAYLOAD_LEN: u8 = 16;
@@ -101,15 +106,94 @@ fn main() -> ! {
     configure_lora(&mut spi, &busy, &mut delay);
     println!("SX1262 ready, mode = {}", if IS_TX { "TX" } else { "RX" });
 
+    let mut motor = peripherals.GPIO26;
+    let mut servo = peripherals.GPIO19;
+    let mut ledc = Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+
+    let mut hstimer0 = ledc.timer::<HighSpeed>(timer::Number::Timer0);
+    hstimer0
+        .configure(timer::config::Config {
+            duty: timer::config::Duty::Duty12Bit,
+            clock_source: timer::HSClockSource::APBClk,
+            frequency: Rate::from_hz(50),
+        })
+        .unwrap();
+    let mut channel0 = ledc.channel(channel::Number::Channel0, servo.reborrow());
+    channel0
+        .configure(channel::config::Config {
+            timer: &hstimer0,
+            duty_pct: 10,
+            drive_mode: DriveMode::PushPull,
+        })
+        .unwrap();
+
+    let mut lstimer0 = ledc.timer::<LowSpeed>(timer::Number::Timer1);
+    lstimer0
+        .configure(timer::config::Config {
+            duty: timer::config::Duty::Duty14Bit, // Higher resolution is better
+            clock_source: timer::LSClockSource::APBClk,
+            frequency: Rate::from_hz(50), // 50 Hz for ESC
+        })
+        .unwrap();
+
+    let mut channel1 = ledc.channel(channel::Number::Channel1, motor);
+    channel1
+        .configure(channel::config::Config {
+            timer: &lstimer0,
+            duty_pct: 0,
+            drive_mode: esp_hal::gpio::DriveMode::PushPull,
+        })
+        .unwrap();
+
+    println!("ESC starting...");
+
+    let max_duty = 16383u32;
+    let period_us = 20_000u32;
+    let us_to_duty = |us: u32| -> u32 {
+        // duty = us / period * max_duty
+        (us * max_duty) / period_us
+    };
+    // === ARMING SEQUENCE (very important) ===
+    // Most ESCs need low throttle for 2–3 seconds to arm
+    //set_esc_throttle(&mut channel1, 1000); // 1000 µs = stop
+    //delay.delay_millis(3000);
+    channel1.set_duty_hw(us_to_duty(1000));
+    delay.delay_millis(4000); // wait for arm
+
+    println!("ESC armed!");
+    for _ in 0..150 {
+        set_esc_throttle2(&mut channel1, 0);
+        delay.delay_millis(20);
+    }
+
+    let max_duty_cycle = channel0.max_duty_cycle() as u32;
+
+    // Minimum duty (2.5%)
+    // For 12bit -> 25 * 4096 /1000 => ~ 102
+    let min_duty = (25 * max_duty_cycle) / 1000;
+    // Maximum duty (12.5%)
+    // For 12bit -> 125 * 4096 /1000 => 512
+    let max_duty = (125 * max_duty_cycle) / 1000;
+    // 512 - 102 => 410
+    let duty_gap = max_duty - min_duty;
+
     let mut last_tx = Instant::now();
     let mut last_print = Instant::now();
     let mut c = ControlCommand::None;
 
     let mut byte = [0u8; 1];
     let mut line = heapless::String::<64>::new();
+
+    // Controller -> Plane
+    // Get control inputs from UART serial
+    // Transmit controls to plane
+    // Receive telemtery back
     if IS_TX {
         let mut n = 0u32;
+        let mut last_sent = ControlCommand::None;
         loop {
+            //line = format!(64; "BANK {}", n).unwrap();
             while uart.read_ready() {
                 match uart.read(&mut byte) {
                     Ok(1) => {
@@ -133,15 +217,35 @@ fn main() -> ! {
                 }
             }
 
-            if last_tx.elapsed() >= Duration::from_millis(100) {
+            if last_tx.elapsed() >= Duration::from_millis(20) {
                 last_tx = Instant::now();
-                let msg = b"Hello ESP32!!!!!"; // 16 bytes
-                if transmit(&mut spi, &busy, &mut delay, msg) {
-                    //println!("TX OK #{}", n);
-                } else {
-                    //println!("TX FAILED #{}", n);
+                let mut msg = heapless::String::<32>::new();
+                match c {
+                    ControlCommand::Bank(v) => {
+                        let _ = write!(msg, "BANK {:.2}", v);
+                    }
+                    ControlCommand::Pitch(v) => {
+                        let _ = write!(msg, "PITCH {:.2}", v);
+                    }
+                    //ControlCommand::None => {
+                    //    // optional: skip TX, or send keepalive
+                    //    let _ = write!(msg, "BANK {:.2}", 0.0);
+                    //}
+                    _ => {}
                 }
-                n = n.wrapping_add(1);
+                if !msg.is_empty() {
+                    let ok = transmit(&mut spi, &busy, &mut delay, msg.as_bytes());
+                    if ok {
+                        last_sent = c;
+                        n = n.wrapping_add(1);
+                    }
+                }
+                //if transmit(&mut spi, &busy, &mut delay, msg) {
+                //    //println!("TX OK #{}", n);
+                //} else {
+                //    //println!("TX FAILED #{}", n);
+                //}
+                //n = n.wrapping_add(1);
             }
             if last_print.elapsed() >= Duration::from_millis(500) {
                 last_print = Instant::now();
@@ -149,14 +253,54 @@ fn main() -> ! {
             }
         }
     } else {
+        // Plane -> Controller
+        // Receive controls from controller
+        // Transmit telemtery back
+        let mut current = ControlCommand::None;
+        let mut bank: f32 = 0.0;
+        let mut pitch: f32 = 0.0;
+        let mut throttle: f32 = 0.0; // 0..100
         loop {
-            match receive(&mut spi, &busy, &dio1, &mut delay, 15_000) {
+            match receive(&mut spi, &busy, &dio1, &mut delay, 50) {
                 Some((buf, len)) => {
-                    println!("RX {} bytes: {:?}", len, &buf[..len]);
-                    println!("RX text: {:?}", core::str::from_utf8(&buf[..len]));
+                    //println!("RX {} bytes: {:?}", len, &buf[..len]);
+                    //println!("RX text: {:?}", core::str::from_utf8(&buf[..len]));
+
+                    if let Some(cmd) = decode_command(&buf[..len]) {
+                        match cmd {
+                            ControlCommand::Bank(v) => bank = v,
+                            ControlCommand::Pitch(v) => pitch = v,
+                            ControlCommand::Throttle(v) => throttle = v.clamp(0.0, 100.0),
+                            ControlCommand::None => {}
+                            _ => {}
+                        }
+                    }
+                    //println!("c: {:?}", c);
                 }
-                None => println!("RX timeout (nothing valid received)"),
+                None => {
+                    println!("RX timeout (nothing valid received)")
+                }
             }
+            let angle = map_bank_to_angle(bank);
+            let duty = duty_from_angle(angle, min_duty, duty_gap);
+            let _ = channel0.set_duty_cycle(duty);
+
+            set_esc_throttle2(&mut channel1, throttle as u16);
+
+            //match current {
+            //    ControlCommand::Bank(v) => {
+            //        //println!("deg: {} ", deg);
+
+            //        let angle = map_bank_to_angle(v);
+            //        let duty = duty_from_angle(angle, min_duty, duty_gap);
+            //        let _ = channel0.set_duty_cycle(duty);
+            //    }
+            //    ControlCommand::Throttle(v) => {
+            //        set_esc_throttle2(&mut channel1, v as u16);
+            //    }
+            //    _ => {}
+            //}
+            delay.delay_millis(20);
         }
     }
 }
@@ -456,7 +600,7 @@ fn receive<S: SpiDevice>(
     None
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum ControlCommand {
     Bank(f32),
     Pitch(f32),
@@ -487,4 +631,78 @@ fn decode_command(raw: &[u8]) -> Option<ControlCommand> {
     };
 
     Some(cmd)
+}
+
+fn package_command(cmd: &ControlCommand) -> &[u8] {
+    match cmd {
+        ControlCommand::None => "".as_bytes(),
+        ControlCommand::Bank(val) => "BANK {}".as_bytes(),
+        ControlCommand::Pitch(val) => "PITCH {}".as_bytes(),
+        _ => "".as_bytes(),
+    }
+}
+fn duty_from_angle(deg: u32, min_duty: u32, duty_gap: u32) -> u16 {
+    let duty = min_duty + ((deg * duty_gap) / 180);
+    duty as u16
+}
+fn map_bank_to_angle(v: f32) -> u32 {
+    // v: 0..100 from joystick intensity code
+    // center at 90 deg, left/right +/- 45
+    // If your PC sends signed bank later, change this.
+    let clamped = v.clamp(0.0, 100.0);
+    let angle = 45.0 + (clamped / 100.0) * 90.0; // 45..135
+    angle as u32
+}
+/// us: 1000 = stop, 2000 = full throttle
+//fn set_esc_throttle<'a>(channel: &mut impl ChannelIFace<'a, LowSpeed>, us: u16) {
+//    let max_duty = 16383u32;
+//    let period_us = 20_000u32;
+//    let us_to_duty = |us: u32| -> u32 {
+//        // duty = us / period * max_duty
+//        (us * max_duty) / period_us
+//    };
+//    // 50 Hz → period = 20_000 µs
+//    // 14-bit resolution → max duty = 16383
+//    //let duty = ((us as u32) * 16383) / 20_000;
+//    //channel.set_duty(duty as u8);
+//    let pulse_us: u32 = 1000 + (us as u32 * 1000) / 4095;
+//    let pulse_us: u32 = pulse_us.clamp(1000, 2000);
+//
+//    channel.set_duty(us_to_duty(pulse_us) as u8);
+//
+//    //println!("raw={}  pulse={} us", raw, pulse_us);
+//}
+
+fn set_esc_throttle<'a>(channel: &mut impl ChannelIFace<'a, LowSpeed>, throttle_0_to_100: u16) {
+    let max_duty = 16_383u32; // 14-bit
+    let period_us = 20_000u32; // 50 Hz
+
+    // clamp 0..=100
+    let t = (throttle_0_to_100 as u32).clamp(0, 100);
+
+    // map 0..100 → 1000..2000 µs
+    let pulse_us = 1000 + (t * 1000) / 100; // 1000..2000
+    // same as: 1000 + t * 10
+
+    let duty = (pulse_us * max_duty) / period_us;
+
+    // IMPORTANT: do not cast duty to u8
+    channel.set_duty(duty as u8).ok();
+    // if your API is set_duty_cycle_fraction / different width, match that type
+}
+
+fn set_esc_throttle2<'a>(channel: &mut impl ChannelIFace<'a, LowSpeed>, throttle_0_to_100: u16) {
+    let max_duty = 255u32; // 8-bit
+    let period_us = 20_000u32; // 50 Hz
+
+    let t = (throttle_0_to_100 as u32).clamp(0, 100);
+
+    // 0..100 → 1000..2000 µs
+    let pulse_us = 1000 + t * 10;
+
+    // pulse → duty
+    let duty = (pulse_us * max_duty) / period_us; // ~12..25
+    let duty = duty.clamp(0, 255) as u8;
+
+    channel.set_duty(duty);
 }
