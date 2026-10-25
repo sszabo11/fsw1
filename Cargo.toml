@@ -1,0 +1,81 @@
+[package]
+edition      = "2024"
+name         = "fsw1"
+rust-version = "1.88"
+version      = "0.1.0"
+
+[[bin]]
+name = "fsw1"
+path = "./src/bin/main.rs"
+
+[dependencies]
+esp-hal = { version = "~1.2.0", features = ["esp32", "unstable"] }
+embedded-hal = "1.0.0"
+esp-println = { version = "0.18.0", features = ["esp32", "log-04"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32"] }
+critical-section = "1.2.0"
+xtensa-lx = "0.13.0"
+embedded-hal-bus = "0.3.0"
+log = "0.4.34"
+nb = "1.1.0"
+regiface = "0.2"   
+mpu6050 = "0.1.6"
+mpu6050-driver = "0.1"
+embedded-io = "0.7.1"
+blocking-network-stack = { git = "https://github.com/bjoernQ/blocking-network-stack.git", rev = "b3ecefc222d8806edd221f266999ca339c52d34e", default-features = false, features = [
+    "dhcpv4",
+    "tcp",
+] }
+esp-rtos = { version = "0.4.0", features = [
+    "defmt",
+    "esp-alloc",
+  "embassy",
+    "esp-radio",
+    "esp32",
+] }
+smoltcp = { version = "0.14.0", default-features = false, features = [
+    "defmt",
+    "medium-ethernet",
+    "multicast",
+    "proto-dhcpv4",
+    "proto-dns",
+    "proto-ipv4",
+    "socket-dns",
+    "socket-icmp",
+    "socket-raw",
+    "socket-tcp",
+    "socket-udp",
+] }
+defmt = "0.3"
+defmt-rtt = "0.4"
+esp-alloc = { version = "0.11.0", features = ["defmt"] }
+esp-radio = { version = "=1.0.0-beta.1", features = [
+    "defmt",
+    "esp-alloc",
+    "esp32",
+    "unstable",
+    "wifi",
+] }
+esp-backtrace = { version = "0.20.0", features = ["esp32", "panic-handler", "defmt"] }
+heapless = { version = "0.9.1" }
+
+##
+
+embassy-executor = "0.10.0"
+embassy-net = { version = "0.9.0", features = ["dhcpv4", "medium-ethernet", "tcp", "dns"] }
+embassy-time = "0.5.0"
+static_cell = "2.1.0"
+sx1262 = "0.3.0"
+
+
+# For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
+[profile.dev]
+# The default debug profile is too slow and too big for resource-constrained devices.
+# Always build with some optimizations enabled.
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1     # LLVM can perform better optimizations using a single thread
+debug         = 2     # prefer slower builds but better debugging experience
+lto           = 'fat'
+opt-level     = 's'
