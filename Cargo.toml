@@ -67,6 +67,9 @@ embassy-time = "0.5.0"
 static_cell = "2.1.0"
 sx1262 = "0.3.0"
 
+[dependencies.num-traits]
+version = "0.2"
+default-features = false
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

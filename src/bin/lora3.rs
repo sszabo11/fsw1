@@ -34,11 +34,13 @@ use esp_println as _;
 use esp_println::logger::init_logger;
 use esp_println::println;
 use heapless::{String, Vec, format};
+use num_traits::float::FloatCore;
 use regiface::Command;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const IS_TX: bool = false;
+//const IS_TX: bool = false;
+const IS_TX: Option<&str> = option_env!("IS_TX");
 
 const FREQUENCY_HZ: u64 = 915_200_000;
 const PAYLOAD_LEN: u8 = 16;
@@ -104,7 +106,25 @@ fn main() -> ! {
     wait_busy(&busy, &mut delay);
 
     configure_lora(&mut spi, &busy, &mut delay);
-    println!("SX1262 ready, mode = {}", if IS_TX { "TX" } else { "RX" });
+
+    let is_tx = if let Some(t) = IS_TX {
+        let t = t.trim().to_lowercase();
+        println!("raw: {}", t);
+        if t == "true" {
+            println!("IS_TX=TRUE => Transmiting...");
+            true
+        } else if t == "false" {
+            println!("IS_TX=FALSE => Receiving...");
+            false
+        } else {
+            println!("Invalud 'IS_TX' env var, defaulting to IS_TX=false");
+            false
+        }
+    } else {
+        println!("No 'IS_TX' env var, defaulting to IS_TX=false");
+        false
+    };
+    println!("SX1262 ready, mode = {}", if is_tx { "TX" } else { "RX" });
 
     let mut motor = peripherals.GPIO26;
     let mut servo = peripherals.GPIO19;
@@ -146,27 +166,28 @@ fn main() -> ! {
         })
         .unwrap();
 
-    println!("ESC starting...");
+    if is_tx == false {
+        println!("ESC starting...");
 
-    let max_duty = 16383u32;
-    let period_us = 20_000u32;
-    let us_to_duty = |us: u32| -> u32 {
-        // duty = us / period * max_duty
-        (us * max_duty) / period_us
-    };
-    // === ARMING SEQUENCE (very important) ===
-    // Most ESCs need low throttle for 2–3 seconds to arm
-    //set_esc_throttle(&mut channel1, 1000); // 1000 µs = stop
-    //delay.delay_millis(3000);
-    channel1.set_duty_hw(us_to_duty(1000));
-    delay.delay_millis(4000); // wait for arm
+        let max_duty = 16383u32;
+        let period_us = 20_000u32;
+        let us_to_duty = |us: u32| -> u32 {
+            // duty = us / period * max_duty
+            (us * max_duty) / period_us
+        };
+        // === ARMING SEQUENCE (very important) ===
+        // Most ESCs need low throttle for 2–3 seconds to arm
+        set_esc_throttle(&mut channel1, 1000); // 1000 µs = stop
+        delay.delay_millis(3000);
+        channel1.set_duty_hw(us_to_duty(1000));
+        delay.delay_millis(4000); // wait for arm
 
-    println!("ESC armed!");
-    for _ in 0..150 {
-        set_esc_throttle2(&mut channel1, 0);
-        delay.delay_millis(20);
+        println!("ESC armed!");
+        for _ in 0..150 {
+            set_esc_throttle2(&mut channel1, 0);
+            delay.delay_millis(20);
+        }
     }
-
     let max_duty_cycle = channel0.max_duty_cycle() as u32;
 
     // Minimum duty (2.5%)
@@ -184,12 +205,13 @@ fn main() -> ! {
 
     let mut byte = [0u8; 1];
     let mut line = heapless::String::<64>::new();
+    let mut prev_throttle = 0.0;
 
     // Controller -> Plane
     // Get control inputs from UART serial
     // Transmit controls to plane
     // Receive telemtery back
-    if IS_TX {
+    if is_tx {
         let mut n = 0u32;
         let mut last_sent = ControlCommand::None;
         loop {
@@ -227,6 +249,12 @@ fn main() -> ! {
                     ControlCommand::Pitch(v) => {
                         let _ = write!(msg, "PITCH {:.2}", v);
                     }
+                    //ControlCommand::Throttle(v) => {
+                    //    if (v - prev_throttle).abs() > 1. {
+                    //        let _ = write!(msg, "THROTTLE {:.2}", v);
+                    //        prev_throttle = v;
+                    //    }
+                    //}
                     //ControlCommand::None => {
                     //    // optional: skip TX, or send keepalive
                     //    let _ = write!(msg, "BANK {:.2}", 0.0);
@@ -267,6 +295,7 @@ fn main() -> ! {
                     //println!("RX text: {:?}", core::str::from_utf8(&buf[..len]));
 
                     if let Some(cmd) = decode_command(&buf[..len]) {
+                        println!("rx cmd: {:?}", cmd);
                         match cmd {
                             ControlCommand::Bank(v) => bank = v,
                             ControlCommand::Pitch(v) => pitch = v,
@@ -275,17 +304,31 @@ fn main() -> ! {
                             _ => {}
                         }
                     }
-                    //println!("c: {:?}", c);
                 }
                 None => {
                     println!("RX timeout (nothing valid received)")
                 }
             }
-            let angle = map_bank_to_angle(bank);
-            let duty = duty_from_angle(angle, min_duty, duty_gap);
+            //et angle = map_bank_to_angle(bank);
+            //println!("bank: {}", bank);
+            let duty = duty_from_bank_angle(bank, min_duty, duty_gap);
+            //println!(
+            //    "bank: {:.2}  → duty: {}  (min={}, gap={})",
+            //    bank, duty, min_duty, duty_gap
+            //);
+            //let mid = min_duty + duty_gap / 2; // ≈ 307
             let _ = channel0.set_duty_cycle(duty);
 
-            set_esc_throttle2(&mut channel1, throttle as u16);
+            //let _ = channel0.set_duty_cycle(mid as u16);
+
+            //let raw = (throttle / 100.) * 4095.;
+            ////set_esc_throttle2(&mut channel1, throttle as u16);
+            //let pulse_us: u32 = 1000 + (raw as u32 * 1000) / 4095;
+            //let pulse_us: u32 = pulse_us.clamp(1000, 2000);
+
+            //channel0.set_duty_hw(us_to_duty(pulse_us));
+
+            //println!("raw={}  pulse={} us", raw, pulse_us);
 
             //match current {
             //    ControlCommand::Bank(v) => {
@@ -532,54 +575,54 @@ fn receive<S: SpiDevice>(
 
     // SetRx, 0xFFFFFF = continuous
     write_cmd(spi, busy, delay, 0x82, &[0xFF, 0xFF, 0xFF]);
-    print_status(spi, busy, delay, "right after SetRx (expect RX)");
-    println!("DIO1 pin = {}", dio1.is_high());
+    //print_status(spi, busy, delay, "right after SetRx (expect RX)");
+    //println!("DIO1 pin = {}", dio1.is_high());
 
     for ms in 0..timeout_ms {
         let bits = get_irq(spi, busy, delay);
 
         if bits != 0 {
-            println!(
-                "t={} ms IRQ={:#06X} [{}{}{}{}{}{}{}] DIO1={}",
-                ms,
-                bits,
-                if bits & IRQ_PREAMBLE != 0 {
-                    "PREAMBLE "
-                } else {
-                    ""
-                },
-                if bits & IRQ_SYNC_WORD != 0 {
-                    "SYNC "
-                } else {
-                    ""
-                },
-                if bits & IRQ_HEADER_VALID != 0 {
-                    "HDR_OK "
-                } else {
-                    ""
-                },
-                if bits & IRQ_HEADER_ERR != 0 {
-                    "HDR_ERR "
-                } else {
-                    ""
-                },
-                if bits & IRQ_CRC_ERR != 0 {
-                    "CRC_ERR "
-                } else {
-                    ""
-                },
-                if bits & IRQ_RX_DONE != 0 {
-                    "RX_DONE "
-                } else {
-                    ""
-                },
-                if bits & IRQ_TIMEOUT != 0 {
-                    "TIMEOUT"
-                } else {
-                    ""
-                },
-                dio1.is_high()
-            );
+            //println!(
+            //    "t={} ms IRQ={:#06X} [{}{}{}{}{}{}{}] DIO1={}",
+            //    ms,
+            //    bits,
+            //    if bits & IRQ_PREAMBLE != 0 {
+            //        "PREAMBLE "
+            //    } else {
+            //        ""
+            //    },
+            //    if bits & IRQ_SYNC_WORD != 0 {
+            //        "SYNC "
+            //    } else {
+            //        ""
+            //    },
+            //    if bits & IRQ_HEADER_VALID != 0 {
+            //        "HDR_OK "
+            //    } else {
+            //        ""
+            //    },
+            //    if bits & IRQ_HEADER_ERR != 0 {
+            //        "HDR_ERR "
+            //    } else {
+            //        ""
+            //    },
+            //    if bits & IRQ_CRC_ERR != 0 {
+            //        "CRC_ERR "
+            //    } else {
+            //        ""
+            //    },
+            //    if bits & IRQ_RX_DONE != 0 {
+            //        "RX_DONE "
+            //    } else {
+            //        ""
+            //    },
+            //    if bits & IRQ_TIMEOUT != 0 {
+            //        "TIMEOUT"
+            //    } else {
+            //        ""
+            //    },
+            //    dio1.is_high()
+            //);
             clear_irq(spi, busy, delay);
 
             if bits & IRQ_RX_DONE != 0 && bits & (IRQ_CRC_ERR | IRQ_HEADER_ERR) == 0 {
@@ -622,7 +665,8 @@ fn decode_command(raw: &[u8]) -> Option<ControlCommand> {
     let val_str = parts.next()?;
     let val: f32 = val_str.parse().ok()?;
 
-    let cmd = match key {
+    //println!("key: {} | val: {}", key, val);
+    let cmd = match key.trim() {
         "BANK" => ControlCommand::Bank(val),
         "PITCH" => ControlCommand::Pitch(val),
         "YAW" => ControlCommand::Yaw(val),
@@ -637,6 +681,7 @@ fn package_command(cmd: &ControlCommand) -> &[u8] {
     match cmd {
         ControlCommand::None => "".as_bytes(),
         ControlCommand::Bank(val) => "BANK {}".as_bytes(),
+        ControlCommand::Throttle(val) => "THROTTLE {}".as_bytes(),
         ControlCommand::Pitch(val) => "PITCH {}".as_bytes(),
         _ => "".as_bytes(),
     }
@@ -644,6 +689,12 @@ fn package_command(cmd: &ControlCommand) -> &[u8] {
 fn duty_from_angle(deg: u32, min_duty: u32, duty_gap: u32) -> u16 {
     let duty = min_duty + ((deg * duty_gap) / 180);
     duty as u16
+}
+fn duty_from_bank_angle(deg: f32, min_duty: u32, duty_gap: u32) -> u16 {
+    let deg = deg.clamp(-90.0, 90.0);
+    let t = (deg + 90.0) / 180.0; // 0.0 … 1.0
+    let duty = min_duty as f32 + t * duty_gap as f32;
+    duty.round() as u16
 }
 fn map_bank_to_angle(v: f32) -> u32 {
     // v: 0..100 from joystick intensity code
