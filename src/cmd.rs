@@ -7,6 +7,8 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+use esp_println::println;
+
 #[derive(Debug, Clone, Copy)]
 pub enum ControlCommand {
     Bank(f32),

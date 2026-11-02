@@ -29,8 +29,7 @@ use esp_hal::uart::Uart;
 use esp_hal::{Blocking, main};
 use fsw1::cmd::{ControlCommand, decode_command};
 use fsw1::data::{ControlPacket, PayloadData, encode_packet};
-use fsw1::rx::Receiver;
-use fsw1::tx::{Transmitter, transmit};
+use fsw1::radio::Radio;
 use fsw1::utils::{configure_lora, wait_busy};
 use heapless::{String, Vec, format};
 use num_traits::float::FloatCore;
@@ -60,7 +59,7 @@ fn main() -> ! {
 
     let mut uart = Uart::new(
         peripherals.UART0,
-        esp_hal::uart::Config::default().with_baudrate(115200),
+        esp_hal::uart::Config::default().with_baudrate(921_600),
     )
     .unwrap()
     .with_rx(peripherals.GPIO3)
@@ -90,6 +89,7 @@ fn main() -> ! {
     println!("SX1262 ready, mode = TX");
 
     let mut controller = Controller::new(spi, busy, delay, uart);
+
     // Controller -> Plane
     // Get control inputs from UART serial
     // Transmit controls to plane
@@ -97,18 +97,13 @@ fn main() -> ! {
     loop {
         controller.read_uart();
         controller.send_command();
-        controller.print_status();
+
+        //controller.print_status();
     }
 }
 
-struct LoraConfig<'a, S: SpiDevice> {
-    spi: S,
-    busy: Input<'a>,
-    delay: Delay,
-}
-
 struct ControllerState {
-    n: u32,
+    n: u8,
     outbound: ControlCommand,
     controls: Controls,
     byte: Vec<u8, 32>,
@@ -124,8 +119,7 @@ struct Controls {
 }
 
 struct Controller<'a, S: SpiDevice> {
-    rx: Receiver<'a, S>,
-    tx: Transmitter<'a, S>,
+    radio: Radio<'a, S>,
     uart: Uart<'a, Blocking>,
     state: ControllerState,
 }
@@ -133,8 +127,7 @@ struct Controller<'a, S: SpiDevice> {
 impl<'a, S: SpiDevice> Controller<'a, S> {
     pub fn new(spi: S, busy: Input<'a>, delay: Delay, uart: Uart<'a, Blocking>) -> Self {
         Self {
-            rx: Receiver::new(spi, busy, delay),
-            tx: Transmitter::new(spi, busy, delay),
+            radio: Radio::new(spi, busy, delay),
             uart,
             state: ControllerState {
                 byte: Vec::new(),
@@ -154,27 +147,56 @@ impl<'a, S: SpiDevice> Controller<'a, S> {
     }
 
     pub fn read_uart(&mut self) {
-        while self.uart.read_ready() {
-            let mut buf = [0u8; 1];
+        let mut buf = [0u8; 32];
+        let mut budget = 128usize;
+        while budget > 0 && self.uart.read_ready() {
             match self.uart.read(&mut buf) {
-                Ok(1) => {
-                    let b = buf[0];
-                    self.state.byte[0] = b;
-
-                    if b == b'\n' || b == b'\r' {
-                        if !self.state.line.is_empty() {
-                            if let Some(command) = decode_command(self.state.line.as_bytes()) {
-                                self.state.outbound = command
+                Ok(n) => {
+                    budget = budget.saturating_sub(n.max(1));
+                    for &b in &buf[..n] {
+                        if b == b'\n' || b == b'\r' {
+                            if !self.state.line.is_empty() {
+                                if let Some(command) = decode_command(self.state.line.as_bytes()) {
+                                    match command {
+                                        ControlCommand::Bank(v) => self.state.controls.bank = v,
+                                        ControlCommand::Pitch(v) => self.state.controls.pitch = v,
+                                        ControlCommand::Throttle(v) => {
+                                            self.state.controls.throttle = v
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                self.state.line.clear();
                             }
-                            self.state.line.clear();
+                        } else if b.is_ascii() && self.state.line.push(b as char).is_err() {
+                            self.state.line.clear(); // line too long, drop it
                         }
-                    } else {
-                        let _ = self.state.line.push(b as char);
                     }
                 }
-                Ok(_) => {}
+                //Ok(1) => {
+                //    let b = buf[0];
+                //    self.state.byte[0] = b;
+
+                //    //println!("b: {}", b);
+                //    if b == b'\n' || b == b'\r' {
+                //        if !self.state.line.is_empty() {
+                //            if let Some(command) = decode_command(self.state.line.as_bytes()) {
+                //                println!("setting outbound to: {:?}", command);
+                //                self.state.outbound = command
+                //            }
+                //            self.state.line.clear();
+                //        }
+                //    } else {
+                //        println!("E");
+                //        let _ = self.state.line.push(b as char);
+                //    }
+                //}
+                //Ok(_) => {
+                //    println!("qwe")
+                //}
                 Err(err) => {
                     println!("error: {}", err);
+                    self.state.line.clear();
                 }
             }
         }
@@ -183,40 +205,18 @@ impl<'a, S: SpiDevice> Controller<'a, S> {
     pub fn send_command(&mut self) {
         if self.state.t_last_tx.elapsed() >= Duration::from_millis(20) {
             self.state.t_last_tx = Instant::now();
-            //let mut msg = heapless::String::<32>::new();
-            //match self.state.outbound {
-            //    ControlCommand::Bank(v) => {
-            //        self.state.bank = v;
-            //    }
-            //    ControlCommand::Pitch(v) => {
-            //        //let _ = write!(msg, "PITCH {:.2}", v);
-            //    }
-            //    //ControlCommand::Throttle(v) => {
-            //    //    if (v - prev_throttle).abs() > 1. {
-            //    //        let _ = write!(msg, "THROTTLE {:.2}", v);
-            //    //        prev_throttle = v;
-            //    //    }
-            //    //}
-            //    //ControlCommand::None => {
-            //    //    // optional: skip TX, or send keepalive
-            //    //    let _ = write!(msg, "BANK {:.2}", 0.0);
-            //    //}
-            //    _ => {}
-            //};
+            //println!("sedning: {} b: {}", self.state.n, self.state.controls.bank);
             let payload = PayloadData::Control(ControlPacket {
-                seq,
+                seq: self.state.n as u8,
                 bank: self.state.controls.bank,
                 pitch: self.state.controls.pitch,
                 yaw: self.state.controls.yaw,
                 throttle: self.state.controls.throttle,
             });
-            //if !msg.is_empty() {
-            let ok = self.tx.send(payload);
+            let ok = self.radio.send(payload);
             if ok {
-                //self.state.last_sent = self.state.outbound;
                 self.state.n = self.state.n.wrapping_add(1);
             }
-            //}
         }
     }
     pub fn print_status(&mut self) {

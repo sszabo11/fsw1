@@ -31,8 +31,9 @@ use esp_println as _;
 use esp_println::logger::init_logger;
 use esp_println::println;
 use fsw1::cmd::{ControlCommand, decode_command};
+use fsw1::data::{PayloadData, TelemetryPacket};
 use fsw1::motors::{duty_from_bank_angle, set_esc_throttle, set_esc_throttle2};
-use fsw1::rx::receive;
+use fsw1::radio::Radio;
 use fsw1::utils::{configure_lora, wait_busy};
 use heapless::{String, Vec, format};
 use num_traits::float::FloatCore;
@@ -135,26 +136,26 @@ fn main() -> ! {
         })
         .unwrap();
 
-    println!("ESC starting...");
+    //println!("ESC starting...");
 
-    let max_duty = 16383u32;
-    let period_us = 20_000u32;
-    let us_to_duty = |us: u32| -> u32 {
-        // duty = us / period * max_duty
-        (us * max_duty) / period_us
-    };
-    // === ARMING SEQUENCE (very important) ===
-    // Most ESCs need low throttle for 2–3 seconds to arm
-    set_esc_throttle(&mut channel1, 1000); // 1000 µs = stop
-    delay.delay_millis(3000);
-    channel1.set_duty_hw(us_to_duty(1000));
-    delay.delay_millis(4000); // wait for arm
+    //let max_duty = 16383u32;
+    //let period_us = 20_000u32;
+    //let us_to_duty = |us: u32| -> u32 {
+    //    // duty = us / period * max_duty
+    //    (us * max_duty) / period_us
+    //};
+    //// === ARMING SEQUENCE (very important) ===
+    //// Most ESCs need low throttle for 2–3 seconds to arm
+    //set_esc_throttle(&mut channel1, 1000); // 1000 µs = stop
+    //delay.delay_millis(3000);
+    //channel1.set_duty_hw(us_to_duty(1000));
+    //delay.delay_millis(4000); // wait for arm
 
-    println!("ESC armed!");
-    for _ in 0..150 {
-        set_esc_throttle2(&mut channel1, 0);
-        delay.delay_millis(20);
-    }
+    //println!("ESC armed!");
+    //for _ in 0..150 {
+    //    set_esc_throttle2(&mut channel1, 0);
+    //    delay.delay_millis(20);
+    //}
     let max_duty_cycle = channel0.max_duty_cycle() as u32;
 
     // Minimum duty (2.5%)
@@ -177,33 +178,13 @@ fn main() -> ! {
     // Plane -> Controller
     // Receive controls from controller
     // Transmit telemtery back
-    let mut current = ControlCommand::None;
-    let mut bank: f32 = 0.0;
-    let mut pitch: f32 = 0.0;
-    let mut throttle: f32 = 0.0; // 0..100
+    let mut controller = Controller::new(spi, busy, delay);
     loop {
-        match receive(&mut spi, &busy, &dio1, &mut delay, 50) {
-            Some((buf, len)) => {
-                //println!("RX {} bytes: {:?}", len, &buf[..len]);
-                //println!("RX text: {:?}", core::str::from_utf8(&buf[..len]));
-
-                if let Some(cmd) = decode_command(&buf[..len]) {
-                    println!("rx cmd: {:?}", cmd);
-                    match cmd {
-                        ControlCommand::Bank(v) => bank = v,
-                        ControlCommand::Pitch(v) => pitch = v,
-                        ControlCommand::Throttle(v) => throttle = v.clamp(0.0, 100.0),
-                        ControlCommand::None => {}
-                        _ => {}
-                    }
-                }
-            }
-            None => {
-                println!("RX timeout (nothing valid received)")
-            }
-        }
-        let duty = duty_from_bank_angle(bank, min_duty, duty_gap);
+        controller.recieve_controls();
+        let duty = duty_from_bank_angle(controller.state.controls.bank, min_duty, duty_gap);
         let _ = channel0.set_duty_cycle(duty);
+
+        //controller.send_telementary();
 
         //let _ = channel0.set_duty_cycle(mid as u16);
 
@@ -217,4 +198,89 @@ fn main() -> ! {
         //println!("raw={}  pulse={} us", raw, pulse_us);
         delay.delay_millis(20);
     }
+}
+
+struct FlightState {
+    n: u8,
+    outbound: TelemetryPacket,
+    controls: Controls,
+    byte: Vec<u8, 32>,
+    line: heapless::String<64>,
+    t_last_tx: Instant,
+    t_last_print: Instant,
+}
+struct Controls {
+    bank: f32,
+    pitch: f32,
+    yaw: f32,
+    throttle: f32,
+}
+
+struct Controller<'a, S: SpiDevice> {
+    radio: Radio<'a, S>,
+    state: FlightState,
+}
+
+impl<'a, S: SpiDevice> Controller<'a, S> {
+    pub fn new(spi: S, busy: Input<'a>, delay: Delay) -> Self {
+        Self {
+            radio: Radio::new(spi, busy, delay),
+            state: FlightState {
+                byte: Vec::new(),
+                line: heapless::String::<64>::new(),
+                n: 0,
+                controls: Controls {
+                    bank: 0.,
+                    pitch: 0.,
+                    yaw: 0.,
+                    throttle: 0.,
+                },
+                outbound: TelemetryPacket {
+                    altitude: 0.,
+                    speed: 0.,
+                    seq: 0,
+                },
+                t_last_tx: Instant::now(),
+                t_last_print: Instant::now(),
+            },
+        }
+    }
+
+    pub fn recieve_controls(&mut self) {
+        match self.radio.receive(50) {
+            PayloadData::Control(p) => {
+                //println!("p:{:?}", p);
+                self.state.controls.bank = p.bank;
+                self.state.controls.pitch = p.pitch;
+                self.state.controls.yaw = p.yaw;
+                self.state.controls.throttle = p.throttle;
+            }
+
+            PayloadData::Timeout => {
+                println!("RX timeout (nothing valid received)")
+            }
+            _ => {}
+        }
+    }
+
+    pub fn send_telementary(&mut self) {
+        if self.state.t_last_tx.elapsed() >= Duration::from_millis(20) {
+            self.state.t_last_tx = Instant::now();
+            let payload = PayloadData::Telemetry(TelemetryPacket {
+                seq: self.state.n as u8,
+                speed: 0.,
+                altitude: 0.,
+            });
+            let ok = self.radio.send(payload);
+            if ok {
+                self.state.n = self.state.n.wrapping_add(1);
+            }
+        }
+    }
+    //pub fn print_status(&mut self) {
+    //    if self.state.t_last_print.elapsed() >= Duration::from_millis(500) {
+    //        self.state.t_last_print = Instant::now();
+    //        println!("command: {:?}  tx#{}", self.state.outbound, self.state.n);
+    //    }
+    //}
 }

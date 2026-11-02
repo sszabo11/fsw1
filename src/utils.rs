@@ -7,10 +7,10 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use defmt::println;
 use embedded_hal::delay::DelayNs;
 use embedded_hal::spi::{Operation, SpiDevice};
 use esp_hal::{delay::Delay, gpio::Input};
+use esp_println::println;
 
 pub const FREQUENCY_HZ: u64 = 915_200_000;
 pub const PAYLOAD_LEN: u8 = 16;
@@ -210,7 +210,7 @@ pub fn configure_lora<S: SpiDevice>(spi: &mut S, busy: &Input, delay: &mut Delay
     );
 
     clear_irq(spi, busy, delay);
-    print_status(spi, busy, delay, "after config (expect STDBY_RC)");
+    //print_status(spi, busy, delay, "after config (expect STDBY_RC)");
 }
 
 pub struct LoraConfig<'a, S: SpiDevice> {

@@ -7,31 +7,14 @@ pub enum PayloadData {
     Control(ControlPacket),
     None,
     Invalid,
+    Timeout,
 }
-
-//impl TryFrom<PayloadError> for PayloadData {
-//    type Error = PayloadError;
-//
-//    fn try_from(raw: ([u8; 64], usize)) -> Result<Self, Self::Error> {
-//        println!("{:?}", raw);
-//        Ok(PayloadData::None)
-//    }
-//}
-//impl TryFrom<RawEnumInput> for PayloadData {
-//    type Error = MyTryFromError;
-//
-//    fn try_from(raw: RawEnumInput) -> Result<Self, Self::Error> {
-//        match raw {
-//            RawEnumInput::KnownVariant => Ok(MyEnum::First),
-//        }
-//    }
-//}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TelemetryPacket {
-    altitude: f32,
-    speed: f32,
-    seq: u8,
+    pub altitude: f32,
+    pub speed: f32,
+    pub seq: u8,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -52,8 +35,9 @@ pub fn encode_packet(p: PayloadData) -> [u8; 8] {
             p[1] = 0;
             p[2] = data.seq;
             // Control packet
-            let bank = p[3..5].copy_from_slice(&((data.bank * 10.) as u8).to_le_bytes());
-            let pitch = p[5..7].copy_from_slice(&((data.pitch * 10.) as u8).to_le_bytes());
+            let bank = p[3..5].copy_from_slice(&((data.bank * 10.) as i16).to_le_bytes());
+            let pitch = p[5..7].copy_from_slice(&((data.pitch * 10.) as i16).to_le_bytes());
+            //println!("after encoding. d b: {}", data.bank);
             p
         }
         PayloadData::Telemetry(_) => {
@@ -78,7 +62,7 @@ pub fn decode_packet(p: [u8; 8]) -> Result<PayloadData, PayloadData> {
     }
 
     let kind = p[1]; // 0, 1
-    println!("kind: {}", kind);
+    //println!("kind: {}", kind);
 
     match kind {
         0 => {
